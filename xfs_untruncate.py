@@ -7,29 +7,39 @@ import re
 
 xfs_signature = b'XFSB'
 xfs_db = 'xfs_db'
-# TODO add block size detection
-fs_blocksize = 4096
 
 parser = argparse.ArgumentParser(prog="xfs_untruncate", usage='%(prog)s [options]', description='Reconstruct XFS file directly from XFS inode V3 two-level B-Tree metadata')
 parser.add_argument('--image', '-i', type=str, help='filesystem image', required=True, action='store', dest='imageFile')
 parser.add_argument('--inode', '-n', type=int, help='inode to recover', required=True, action='store', dest='targetInode')
 parser.add_argument('--outFile', '-o', type=str, help='target file to write recovered data', required=False, action='store', dest='outFile')
 parser.add_argument('--limit', '-l', type=str, help='maximum of first bytes to be recovered', required=False, action='store', dest='outLimit')
+parser.add_argument('--verbosity', '-v', help='print additional information about recovery process', required=False, action='store_true', dest='verbosity')
 
 args = parser.parse_args()
 
-print("Processing XFS filesystem image " + args.imageFile + " to recover inode " + str(args.targetInode))
+if args.verbosity:
+    print("Processing XFS filesystem image " + args.imageFile + " to recover inode " + str(args.targetInode))
 
 fsraw = open(args.imageFile, 'rb')
 fsraw.seek(0, 0)
 if fsraw.read(4) == xfs_signature:
-    print("XFS detected")
+    if (args.verbosity):
+        print("XFS detected")
 else:
     print("Unknown FS type")
     raise SyntaxError
 fsraw.close();
 
-
+result = subprocess.run([xfs_db, args.imageFile, '-c', 'sb', '-c', 'p'], stdout=subprocess.PIPE)
+resultstr = result.stdout.decode('utf-8')
+if resultstr.find("Filesystem corruption detected") != -1:
+    print("Bad inode header - possibly incorrect number")
+    raise SyntaxError
+if resultstr.find("Filesystem CRC error detected") != -1:
+    print("Inode header corrupted")
+    raise SyntaxError
+superblockMeta = dict(re.findall(r'(\S+)\s+=\s+(\S+)', resultstr))
+fs_blocksize = int(superblockMeta['blocksize'])
 
 result = subprocess.run([xfs_db, args.imageFile, '-c', 'inode {0}'.format(args.targetInode), '-c', 'p'], stdout=subprocess.PIPE)
 resultstr = result.stdout.decode('utf-8')
@@ -41,7 +51,6 @@ if resultstr.find("Metadata CRC error detected") != -1:
     raise SyntaxError
 
 inode_meta = dict(re.findall(r'(\S+)\s+=\s+(\S+)', resultstr))
-
 if inode_meta['core.version'] != '3' or inode_meta['core.format'] != '3':
     print("Inode type unsupported - try using xfs_undelete")
     raise SyntaxError
@@ -53,10 +62,10 @@ def walkBTreeExtents(level, prevLevelCmd):
     if(level > 0):
         result = subprocess.run(prevLevelCmd + ['-c','p'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if result.returncode != 0:
-            print("Error at level " + str(level) + " on cmd " + ' '.join(prevLevelCmd));
+            print("Skipping some data, error at level " + str(level) + " on cmd " + ' '.join(prevLevelCmd));
             return {}
         if result.stderr.decode('utf-8').find("Metadata CRC error detected") != -1:
-            print("Error at level " + str(level) + " on cmd " + ' '.join(prevLevelCmd));
+            print("Skipping some data, error at level " + str(level) + " on cmd " + ' '.join(prevLevelCmd));
             return {}
         resultstr = result.stdout.decode('utf-8')
         curEntryMeta = dict(re.findall(r'(\S+)\s+=\s+(\S+)', resultstr))
@@ -71,10 +80,10 @@ def walkBTreeExtents(level, prevLevelCmd):
     if(level == 0):
         result = subprocess.run(prevLevelCmd + ['-c','p'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if result.returncode != 0:
-            print("Error at level " + str(level) + " on cmd " + ' '.join(prevLevelCmd));
+            print("Skipping some data, error at level " + str(level) + " on cmd " + ' '.join(prevLevelCmd));
             return {}
         if result.stderr.decode('utf-8').find("Metadata CRC error detected") != -1:
-            print("Error at level " + str(level) + " on cmd " + ' '.join(prevLevelCmd));
+            print("Skipping some data, error at level " + str(level) + " on cmd " + ' '.join(prevLevelCmd));
             return {}
         resultstr = result.stdout.decode('utf-8')
         return dict(re.findall(r'\d+:\[(\d+),(\d+,\d+,\d+)\]', resultstr))
@@ -102,6 +111,7 @@ def recoverData(ifFile, fileOffsetBlock, diskStartblock, blockcount):
             print(result.stderr.decode('utf-8'))
 
 extentsCheckRecover = []
+extentsRecovered = 0
 
 for fileOffsetBlock in sorted(extentsMap.keys()):
     if args.outLimit:
@@ -110,7 +120,8 @@ for fileOffsetBlock in sorted(extentsMap.keys()):
             break
 
     if fileOffsetBlock > lastWrittenBlock:
-        print("\t" + str(entryNumber) + ": [" + str(lastWrittenBlock * blockDivider) + ".." + str(fileOffsetBlock * blockDivider - 1) + "]: hole")
+        if (args.verbosity):
+            print("\t" + str(entryNumber) + ": [" + str(lastWrittenBlock * blockDivider) + ".." + str(fileOffsetBlock * blockDivider - 1) + "]: hole")
         recoverData('/dev/zero', lastWrittenBlock, 0, fileOffsetBlock - lastWrittenBlock)
         extentsCheckRecover.append([lastWrittenBlock, fileOffsetBlock - lastWrittenBlock])
         totalRecoveredBytes = totalRecoveredBytes + (fileOffsetBlock - lastWrittenBlock) * fs_blocksize
@@ -118,11 +129,13 @@ for fileOffsetBlock in sorted(extentsMap.keys()):
         entryNumber = entryNumber + 1
 
     [curStartblock, curBlockcount, curExtentflag] = extentsMap[fileOffsetBlock].split(',')
-    print("\t" + str(entryNumber) + ": [" + str(int(lastWrittenBlock * blockDivider)) + ".." + str(int((lastWrittenBlock + int(curBlockcount)) * blockDivider - 1)) + "]: " + str(int(curStartblock) * blockDivider) + ".." + str((int(curStartblock) + int(curBlockcount)) * blockDivider - 1))
+    if (args.verbosity):
+        print("\t" + str(entryNumber) + ": [" + str(int(lastWrittenBlock * blockDivider)) + ".." + str(int((lastWrittenBlock + int(curBlockcount)) * blockDivider - 1)) + "]: " + str(int(curStartblock) * blockDivider) + ".." + str((int(curStartblock) + int(curBlockcount)) * blockDivider - 1))
     recoverData(args.imageFile, fileOffsetBlock, int(curStartblock), int(curBlockcount))
     extentsCheckRecover.append([fileOffsetBlock, int(curBlockcount)])
     totalRecoveredBytes = totalRecoveredBytes + int(curBlockcount) * fs_blocksize
     lastWrittenBlock = lastWrittenBlock + int(curBlockcount)
+    extentsRecovered = extentsRecovered + 1
     entryNumber = entryNumber + 1
 
 
@@ -133,10 +146,14 @@ for recoveredRecord in extentsCheckRecover:
             print("Missing extent record before " + str(recoveredRecord[0]))
     lastRecord = recoveredRecord;
 
-print("Total recovered: " + str(totalRecoveredBytes))
+if args.verbosity or int(inode_meta['core.nextents']) != extentsRecovered:
+    print("Extents in header " + inode_meta['core.nextents'] + ", extents recovered " + str(extentsRecovered))
+
+if (args.verbosity):
+    print("Total bytes recovered: " + str(totalRecoveredBytes))
 
 if args.outFile == None:
-    print("Warning! It have been dry run, to save data specify out file with -o option")
+    print("Warning! Dry run, to save data specify out file with -o option")
 
 
 
